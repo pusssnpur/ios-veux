@@ -31,32 +31,48 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'VEUX' }}
+  XCODE_PATH: /Applications/Xcode_15.4.app/Contents/Developer
 
 jobs:
   build:
-    # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
-    # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
+    # xnu-8796 / iOS 16-era ABI expects the Xcode 15 toolchain. GitHub-hosted macOS
+    # images ship newer Xcodes by default, which emit IORPC.kernelContent and break
+    # the tree. Install and select Xcode 15 explicitly before building.
     runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Xcode 15
+        shell: bash
+        run: |
+          brew install jq gum bash cmake ninja xcodes
+          sudo xcodes install 15.4
+
+          if [ ! -d "$XCODE_PATH" ]; then
+            echo "Xcode 15.4 was not installed at $XCODE_PATH" >&2
+            ls -d /Applications/Xcode*.app || true
+            exit 1
+          fi
+
+          sudo xcode-select -switch "$XCODE_PATH"
+          xcodebuild -version
+          xcrun --find iig
 
       - name: Fetch build script
         run: |
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
-          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; the VEUX kernel is plain arm64
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
-          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          sed -i '' 's/ARCHS=\"x86_64 arm64e\" VALID_ARCHS=\"x86_64 arm64e\"/ARCHS=\"x86_64 arm64e arm64\" VALID_ARCHS=\"x86_64 arm64e arm64\"/' dxb/build.sh
+          grep -c 'VALID_ARCHS=\"x86_64 arm64e arm64\"' dxb/build.sh
           ls dxb/patches
 
       - name: Deps
+        env:
+          DEVELOPER_DIR: ${{ env.XCODE_PATH }}
         run: |
-          brew install jq gum bash cmake ninja
-          # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
@@ -70,15 +86,15 @@ jobs:
       - name: Build
         working-directory: dxb
         env:
-          # keep going after errors so one run reports every compile failure
+          DEVELOPER_DIR: ${{ env.XCODE_PATH }}
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: bash build.sh
 
       - name: Package build tree for local compiles
         if: always()
+        env:
+          DEVELOPER_DIR: ${{ env.XCODE_PATH }}
         run: |
-          # Generated headers, config option headers, mig output and the patched
-          # source: enough to re-run any single compile command from the log locally.
           SDK=$(xcrun --sdk macosx --show-sdk-path)
           mkdir -p sdk-kernel-platform
           cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
