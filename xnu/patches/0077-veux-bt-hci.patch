@@ -1,0 +1,648 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,3 +111,4 @@
+ bsd/dev/veux_spmi.c			standard
+ bsd/dev/veux_usb.c			standard
++bsd/dev/veux_bt.c			standard
+ bsd/dev/mem.c				standard
+--- a/bsd/dev/veux_ufs.c
++++ b/bsd/dev/veux_ufs.c
+@@ -55,3 +55,4 @@
+ extern void veux_usb_probe(void);
+ 
++extern void veux_bt_init(void);
+ #define REG_CAP         0x00
+@@ -661,4 +661,5 @@
+ 	veux_touch_init();
+ 	veux_usb_probe();
++	veux_bt_init();
+ 	return 0;
+ }
+--- /dev/null
++++ b/bsd/dev/veux_bt.c
+@@ -0,0 +1,625 @@
++/*
++ * VEUX WCN3990 Bluetooth bring-up, step 1 - UART, power pulses, EDL version.
++ *
++ * Bluetooth rides GENI HS UART SE1 (qupv3_se1 at 0x04a84000, holi-qupv3.dtsi).
++ * The WCN3990 is enabled by BT_SW_CTRL (gpio69, active high) and its UART
++ * autobaud engine is tripped by the power-on/off pulses (0xFC / 0xC0) that an
++ * external circuit decodes on TX at the programmed baud rate.  After the
++ * pulses the controller speaks H4 at 115200 baud: CTS=gpio61, RX=gpio64,
++ * TX=gpio63, RTS=gpio62, all on function qup01.
++ *
++ * Clocks: vote wrap0 m/s ahb + wrap0_s1 SE (bits 6/7/11 of 0x7900c), program
++ * the wrap0_s1 RCG (cmd_rcgr 0x1f278) to 7372800 Hz from P_GPLL0_OUT_EVEN
++ * (300 MHz * 384 / 15625), then divide the SE clock by 4 (1843200 Hz =
++ * 115200 * 16).
++ *
++ * This step only proves the UART path: it sends the QCA power pulses, reads
++ * the EDL version, and logs every byte that arrives afterwards.  No firmware
++ * or NVM upload, no PMIC/RPMh writes, no GIC interrupts - fully polled, like
++ * the veux touch driver.
++ *
++ * Boot-args:  veuxbt=0        skip entirely
++ *             veuxbtdelay=N   wait N seconds before starting (default 0)
++ */
++#if defined(ARM64_BOARD_CONFIG_VEUX)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t);
++void veux_bt_init(void);
++
++#define BT_SE_PA        0x04a84000u	/* qupv3_se1 HS UART */
++#define BT_SE_SIZE      0x00004000u
++#define BT_GCC_PA       0x01400000u	/* gcc */
++#define BT_GCC_SIZE     0x001f0000u
++#define BT_GPIO_PA      0x00400000u	/* tlmm / pinctrl window */
++#define BT_GPIO_SIZE    0x0005b000u
++
++#define BT_GPIO_SW_CTRL 69u	/* qcom,bt-sw-ctrl-gpio, active high */
++#define BT_GPIO_CTS     61u
++#define BT_GPIO_RTS     62u
++#define BT_GPIO_TX      63u
++#define BT_GPIO_RX      64u
++
++/* GCC: wrap0 m/s ahb + wrap0_s1 SE branch enables, bits 6/7/11 of 0x7900c. */
++#define BT_GCC_VOTE         0x0007900cu
++#define BT_VOTE_M_AHB       BIT(6)
++#define BT_VOTE_S_AHB       BIT(7)
++#define BT_VOTE_SE_CLK      BIT(11)
++#define BT_RCM_M_AHB        0x0001f004u	/* halt bit31 = off */
++#define BT_RCM_S_AHB        0x0001f008u
++#define BT_RCU_SE_CLK       0x0001f274u	/* wrap0_s1 branch halt */
++#define BT_RCG_SE_CLK       0x0001f278u	/* wrap0_s1 cmd_rcgr */
++
++/* RCG2 registers, off cmd_rcgr; wrap0_s1: mnd_width 16, hid_width 5. */
++#define RCG_CMD         0x00
++#define RCG_CMD_UPDATE  BIT(0)
++#define RCG_CFG         0x04
++#define RCG_CFG_SRC_DIV_SHIFT   0
++#define RCG_CFG_SRC_SEL_SHIFT   8
++#define RCG_CFG_SRC_SEL_MASK    (0x7u << RCG_CFG_SRC_SEL_SHIFT)
++#define RCG_CFG_MODE_SHIFT      12
++#define RCG_CFG_MODE_DUAL_EDGE  (2u << RCG_CFG_MODE_SHIFT)
++#define RCG_M           0x08
++#define RCG_N           0x0c
++#define RCG_D           0x10
++#define RCG_MASK16      0xffffu
++
++/* 7372800 = 300 MHz (GPLL0_OUT_EVEN, gcc_parent_map_1 cfg 2) * 384 / 15625.
++ * SRC_DIV field 1 = divide by 1; SRC_SEL field 2 = GPLL0_OUT_EVEN. */
++#define BT_RCG_RATE     7372800u
++#define BT_RCG_SRC_DIV  1u
++#define BT_RCG_SRC_SEL  2u
++#define BT_RCG_M        384u
++#define BT_RCG_N        15625u
++
++/* GENI SE registers (msm-geni-se.h). */
++#define SE_GENI_STATUS            0x040u
++#define SE_GENI_M_CLK_CFG         0x048u	/* SER_CLK_EN | div<<4 */
++#define SE_GENI_S_CLK_CFG         0x04cu
++#define SE_GENI_FW_REVISION       0x068u	/* proto = bits15:8, UART = 2 */
++#define SE_GENI_BYTE_GRAN         0x254u
++#define SE_GENI_DMA_MODE_EN       0x258u
++#define SE_GENI_TX_PACKING_CFG0   0x260u
++#define SE_GENI_TX_PACKING_CFG1   0x264u
++#define SE_GENI_RX_PACKING_CFG0   0x284u
++#define SE_GENI_RX_PACKING_CFG1   0x288u
++#define SE_GENI_CFG_REG80         0x240u
++#define SE_GENI_IRQ_EN            0xe1cu	/* SE_IRQ_EN */
++#define SE_GENI_GSI_EVENT_EN      0xe18u
++#define SE_GENI_CGC_CTRL          0x028u
++#define SE_GENI_DMA_GENERAL_CFG   0xe30u
++#define SE_GENI_OUTPUT_CTRL       0x024u
++#define SE_GENI_FORCE_DEFAULT     0x020u
++#define SE_GENI_M_IRQ_EN          0x614u
++#define SE_GENI_M_IRQ_STATUS      0x610u
++#define SE_GENI_M_IRQ_CLEAR       0x618u
++#define SE_GENI_S_IRQ_EN          0x644u
++#define SE_GENI_S_IRQ_STATUS      0x640u
++#define SE_GENI_S_IRQ_CLEAR       0x648u
++#define SE_GENI_M_CMD0            0x600u
++#define SE_GENI_M_CMD_CTRL_REG    0x604u
++#define SE_GENI_S_CMD0            0x630u
++#define SE_GENI_S_CMD_CTRL_REG    0x634u
++#define SE_GENI_TX_FIFO           0x700u
++#define SE_GENI_RX_FIFO           0x780u
++#define SE_GENI_TX_FIFO_STATUS    0x800u
++#define SE_GENI_RX_FIFO_STATUS    0x804u
++#define SE_GENI_TX_WATERMARK      0x80cu
++#define SE_GENI_RX_WATERMARK      0x810u
++#define SE_GENI_RX_RFR_WATERMARK  0x814u
++
++/* SE_UART registers (msm_geni_serial.c). */
++#define SE_UART_LOOPBACK_CFG      0x22cu
++#define SE_UART_TX_TRANS_CFG      0x25cu	/* bit1 UART_CTS_MASK = ignore CTS */
++#define SE_UART_TX_PARITY_CFG     0x2a4u
++#define SE_UART_RX_PARITY_CFG     0x2a8u
++#define SE_UART_TX_WORD_LEN       0x268u
++#define SE_UART_TX_STOP_BIT_LEN   0x26cu
++#define SE_UART_TX_TRANS_LEN      0x270u
++#define SE_UART_RX_TRANS_CFG      0x280u
++#define SE_UART_RX_WORD_LEN       0x28cu
++#define SE_UART_RX_STALE_CNT      0x294u
++#define SE_UART_MANUAL_RFR        0x2acu
++
++#define UART_CTS_MASK             BIT(1)
++#define TX_STOP_BIT_LEN_1         0u
++#define UART_START_TX             0x1u
++#define UART_START_READ           0x1u
++#define UART_PARAM_RFR_OPEN       BIT(7)
++#define M_OPCODE_SHFT             27u
++#define S_OPCODE_SHFT             27u
++#define M_PARAMS_MSK              GENMASK(26, 0)
++#define S_PARAMS_MSK              GENMASK(26, 0)
++#define M_GENI_CMD_ABORT          BIT(1)
++#define S_GENI_CMD_CANCEL         BIT(2)
++
++#define SE_STATUS_M_CMD_ACTIVE    BIT(0)
++#define SE_STATUS_S_CMD_ACTIVE    BIT(12)
++#define SE_STATUS_TX_FIFO_DEPTH_SHFT  16
++#define SE_STATUS_TX_FIFO_DEPTH_MSK   GENMASK(5, 0)
++#define SE_STATUS_TX_FIFO_WIDTH_SHFT  24
++#define SE_STATUS_TX_FIFO_WIDTH_MSK   GENMASK(5, 0)
++
++#define TX_FIFO_WC_MSK        GENMASK(27, 0)
++#define RX_FIFO_WC_MSK        GENMASK(24, 0)
++#define RX_LAST_BYTE_VALID_MSK  GENMASK(30, 28)
++#define RX_LAST_BYTE_VALID_SHFT 28
++#define RX_LAST                 BIT(31)
++
++/* H4 / QCA EDL constants (copied from btqca.h, self-contained). */
++#define H4_CMD                  0x01u
++#define H4_EVENT                0x04u
++#define QCA_WCN3990_POWERON_PULSE  0xFC
++#define QCA_WCN3990_POWEROFF_PULSE 0xC0
++#define EDL_PATCH_CMD_OPCODE    0xFC00
++#define EDL_PATCH_VER_REQ_CMD   0x19
++#define EDL_CMD_REQ_RES_EVT     0x00
++#define EDL_APP_VER_RES_EVT     0x02
++#define HCI_EV_VENDOR           0xFF
++
++#define BT_RX_BUF_WORDS 16u
++
++static struct {
++	vm_offset_t se, gcc, gpio;
++	bool started, dead, edl_seen, edl_ok;
++	uint32_t tx_fifo_depth;
++	uint32_t product_id, patch_ver, rom_ver, soc_id;
++	uint64_t rx_bytes;
++	uint8_t h4_buf[64];
++	unsigned h4_len;
++	uint8_t h4_expect;
++	bool h4_have_event;
++} st;
++static int bt_sleep_chan;
++
++static uint32_t
++bt_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++bt_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++bt_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&bt_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++bt_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(bt_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++bt_gpio(unsigned pin, unsigned mux, unsigned pull, bool out, bool high)
++{
++	uint32_t off = (uint32_t)pin * 0x1000u;
++	uint32_t cfg = bt_rd(st.gpio, off);
++	if (out) {
++		/* Set the desired latch before enabling output. */
++		bt_wr(st.gpio, off + 4u,
++		    (bt_rd(st.gpio, off + 4u) & ~2u) | (high ? 2u : 0u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (out ? 0x200u : 0u); /* drive = 0 => 2 mA */
++	bt_wr(st.gpio, off, cfg);
++}
++
++static bool
++bt_clocks(void)
++{
++	/* Vote wrap0 m/s ahb and wrap0_s1 SE clocks. */
++	bt_wr(st.gcc, BT_GCC_VOTE,
++	    bt_rd(st.gcc, BT_GCC_VOTE) |
++	    BT_VOTE_M_AHB | BT_VOTE_S_AHB | BT_VOTE_SE_CLK);
++
++	/* Program wrap0_s1 RCG to 7372800 Hz off GPLL0_OUT_EVEN (300 MHz). */
++	uint32_t rcg = BT_RCG_SE_CLK;
++	uint32_t cfg = bt_rd(st.gcc, rcg + RCG_CFG);
++	cfg = (cfg & ~0x10371fu) | (BT_RCG_SRC_DIV << RCG_CFG_SRC_DIV_SHIFT) |
++	    (BT_RCG_SRC_SEL << RCG_CFG_SRC_SEL_SHIFT) | RCG_CFG_MODE_DUAL_EDGE;
++	bt_wr(st.gcc, rcg + RCG_M, BT_RCG_M);
++	bt_wr(st.gcc, rcg + RCG_N, (~(BT_RCG_N - BT_RCG_M)) & RCG_MASK16);
++	{
++		uint32_t d_val = BT_RCG_N;
++		uint32_t n2m = (BT_RCG_N - BT_RCG_M) * 2u;
++		if (d_val < BT_RCG_M) {
++			d_val = BT_RCG_M;
++		}
++		if (d_val > n2m) {
++			d_val = n2m;
++		}
++		bt_wr(st.gcc, rcg + RCG_D, (~d_val) & RCG_MASK16);
++	}
++	bt_wr(st.gcc, rcg + RCG_CFG, cfg);
++	bt_wr(st.gcc, rcg + RCG_CMD,
++	    bt_rd(st.gcc, rcg + RCG_CMD) | RCG_CMD_UPDATE);
++	if (!bt_wait_clear(st.gcc, rcg + RCG_CMD, RCG_CMD_UPDATE)) {
++		printf("VEUX BT: RCG update timeout\n");
++		return false;
++	}
++	const uint32_t branches[] = {BT_RCM_M_AHB, BT_RCM_S_AHB, BT_RCU_SE_CLK};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (!bt_wait_clear(st.gcc, branches[i], 1u << 31)) {
++			printf("VEUX BT: GCC branch %#x halted (%#x)\n", branches[i],
++			    bt_rd(st.gcc, branches[i]));
++			return false;
++		}
++	}
++
++	/* SE clock = 7372800 / 4 = 1843200 Hz = 115200 * 16 (also exact at 2400). */
++	bt_wr(st.se, SE_GENI_M_CLK_CFG, BIT(0) | (4u << 4));
++	bt_wr(st.se, SE_GENI_S_CLK_CFG, BIT(0) | (4u << 4));
++	(void)bt_rd(st.se, SE_GENI_M_CLK_CFG);
++
++	uint32_t proto = (bt_rd(st.se, SE_GENI_FW_REVISION) >> 8u) & 0xffu;
++	printf("VEUX BT: vote=%#x rcg_cfg=%#x m=%#x n=%#x d=%#x proto=%u\n",
++	    bt_rd(st.gcc, BT_GCC_VOTE),
++	    bt_rd(st.gcc, rcg + RCG_CFG),
++	    bt_rd(st.gcc, rcg + RCG_M),
++	    bt_rd(st.gcc, rcg + RCG_N),
++	    bt_rd(st.gcc, rcg + RCG_D),
++	    proto);
++	return true;
++}
++
++static void
++bt_se_init(void)
++{
++	uint32_t se = st.se;
++	uint32_t val;
++
++	/* Mirror geni_se_irq_clear + io_init + io_set_mode, polled. */
++	bt_wr(se, SE_GENI_GSI_EVENT_EN, 0);
++	bt_wr(se, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
++	bt_wr(se, SE_GENI_S_IRQ_CLEAR, 0xffffffffu);
++	val = bt_rd(se, SE_GENI_IRQ_EN);
++	val |= BIT(0) | BIT(1) | BIT(2) | BIT(3);
++	bt_wr(se, SE_GENI_IRQ_EN, val);
++	val = bt_rd(se, SE_GENI_DMA_MODE_EN);
++	val &= ~BIT(0);
++	bt_wr(se, SE_GENI_DMA_MODE_EN, val);
++	bt_wr(se, SE_GENI_GSI_EVENT_EN, 0);
++
++	val = bt_rd(se, SE_GENI_CGC_CTRL);
++	val |= GENMASK(6, 0);
++	bt_wr(se, SE_GENI_CGC_CTRL, val);
++	val = bt_rd(se, SE_GENI_DMA_GENERAL_CFG);
++	val |= 0x0fu;
++	bt_wr(se, SE_GENI_DMA_GENERAL_CFG, val);
++	bt_wr(se, SE_GENI_OUTPUT_CTRL, GENMASK(6, 0));
++	bt_wr(se, SE_GENI_FORCE_DEFAULT, BIT(0));
++
++	st.tx_fifo_depth =
++	    (bt_rd(se, SE_GENI_STATUS) >> SE_STATUS_TX_FIFO_DEPTH_SHFT) &
++	    SE_STATUS_TX_FIFO_DEPTH_MSK;
++	if (!st.tx_fifo_depth) {
++		st.tx_fifo_depth = 16;
++	}
++
++	/* UART line: 8N1, no parity, CTS ignored, words=8 bits, 1 stop bit. */
++	bt_wr(se, SE_UART_LOOPBACK_CFG, 0);
++	bt_wr(se, SE_UART_TX_TRANS_CFG, UART_CTS_MASK);
++	bt_wr(se, SE_UART_TX_PARITY_CFG, 0);
++	bt_wr(se, SE_UART_RX_PARITY_CFG, 0);
++	bt_wr(se, SE_UART_TX_WORD_LEN, 8);
++	bt_wr(se, SE_UART_RX_WORD_LEN, 8);
++	bt_wr(se, SE_UART_TX_STOP_BIT_LEN, TX_STOP_BIT_LEN_1);
++	bt_wr(se, SE_UART_RX_STALE_CNT, 160u); /* STALE_COUNT */
++	bt_wr(se, SE_GENI_TX_WATERMARK, 2u);
++
++	/* Packing: TX 8x1 (one byte per FIFO word, no padding), RX 8x4. */
++	bt_wr(se, SE_GENI_TX_PACKING_CFG0, 0x0000000fu);
++	bt_wr(se, SE_GENI_TX_PACKING_CFG1, 0x00000000u);
++	bt_wr(se, SE_GENI_RX_PACKING_CFG0, 0x0004380eu);
++	bt_wr(se, SE_GENI_RX_PACKING_CFG1, 0x000c3e0eu);
++
++	val = bt_rd(se, SE_GENI_M_IRQ_EN);
++	val |= BIT(0) | GENMASK(6, 1) | BIT(26) | BIT(27) | BIT(30);
++	bt_wr(se, SE_GENI_M_IRQ_EN, val);
++	val = bt_rd(se, SE_GENI_S_IRQ_EN);
++	val |= BIT(0) | GENMASK(5, 1) | GENMASK(13, 9) | GENMASK(29, 24);
++	bt_wr(se, SE_GENI_S_IRQ_EN, val);
++
++	/* Drop any RX data inherited from earlier owners. */
++	(void)bt_rd(se, SE_GENI_RX_FIFO_STATUS);
++	while (bt_rd(se, SE_GENI_RX_FIFO_STATUS) & RX_FIFO_WC_MSK) {
++		(void)bt_rd(se, SE_GENI_RX_FIFO);
++	}
++}
++
++static void
++bt_set_baud(unsigned baud)
++{
++	uint32_t div = BT_RCG_RATE / (baud * 16u); /* 2400 -> 192, 115200 -> 4 */
++	uint32_t cfg = BIT(0) | (div << 4);
++	bt_wr(st.se, SE_GENI_M_CLK_CFG, cfg);
++	bt_wr(st.se, SE_GENI_S_CLK_CFG, cfg);
++	(void)bt_rd(st.se, SE_GENI_M_CLK_CFG);
++	printf("VEUX BT: baud=%u div=%u\n", baud, div);
++}
++
++static bool
++bt_tx(const uint8_t *data, unsigned n)
++{
++	bt_wr(st.se, SE_UART_TX_TRANS_LEN, n);
++	bt_wr(st.se, SE_GENI_M_CMD0, UART_START_TX << M_OPCODE_SHFT);
++	__asm__ volatile("dmb osh" ::: "memory");
++
++	unsigned sent = 0;
++	while (sent < n) {
++		bool room = false;
++		for (unsigned i = 0; i < 200000; ++i) {
++			if ((bt_rd(st.se, SE_GENI_TX_FIFO_STATUS) & TX_FIFO_WC_MSK) <
++			    st.tx_fifo_depth) {
++				room = true;
++				break;
++			}
++			delay(1);
++		}
++		if (!room) {
++			printf("VEUX BT: TX FIFO stall\n");
++			return false;
++		}
++		uint32_t word = 0;
++		unsigned chunk = n - sent;
++		if (chunk > 4u) {
++			chunk = 4u;
++		}
++		for (unsigned j = 0; j < chunk; ++j) {
++			word |= (uint32_t)data[sent + j] << (8u * j);
++		}
++		bt_wr(st.se, SE_GENI_TX_FIFO, word);
++		sent += chunk;
++	}
++
++	bool done = false;
++	for (unsigned i = 0; i < 200000; ++i) {
++		if (bt_rd(st.se, SE_GENI_M_IRQ_STATUS) & BIT(0)) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done) {
++		bt_wr(st.se, SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_ABORT);
++		printf("VEUX BT: TX done timeout\n");
++		return false;
++	}
++	bt_wr(st.se, SE_GENI_M_IRQ_CLEAR, BIT(0));
++	return true;
++}
++
++static void
++bt_start_rx(void)
++{
++	uint32_t se = st.se;
++	if (bt_rd(se, SE_GENI_STATUS) & SE_STATUS_S_CMD_ACTIVE) {
++		bt_wr(se, SE_GENI_S_CMD_CTRL_REG, S_GENI_CMD_CANCEL);
++		bt_wait_clear(se, SE_GENI_STATUS, SE_STATUS_S_CMD_ACTIVE);
++	}
++	uint32_t s_cmd = bt_rd(se, SE_GENI_S_CMD0);
++	s_cmd &= ~(S_OPCODE_MSK | S_PARAMS_MSK);
++	s_cmd |= (UART_START_READ << S_OPCODE_SHFT) |
++	    (UART_PARAM_RFR_OPEN & S_PARAMS_MSK);
++	bt_wr(se, SE_GENI_S_CMD0, s_cmd);
++}
++
++static void
++bt_rx_drain(bool drop)
++{
++	uint32_t status = bt_rd(st.se, SE_GENI_RX_FIFO_STATUS);
++	unsigned wc = (unsigned)(status & RX_FIFO_WC_MSK);
++	if (!wc) {
++		return;
++	}
++	if (wc > BT_RX_BUF_WORDS) {
++		wc = BT_RX_BUF_WORDS;
++	}
++	unsigned rbv = (status & RX_LAST_BYTE_VALID_MSK) >>
++	    RX_LAST_BYTE_VALID_SHFT;
++	bool last = (status & RX_LAST) != 0u;
++	unsigned bytes = (wc - 1u) * 4u;
++	bytes += (last && rbv) ? rbv : 4u;
++
++	uint32_t buf[BT_RX_BUF_WORDS];
++	for (unsigned i = 0; i < wc; ++i) {
++		buf[i] = bt_rd(st.se, SE_GENI_RX_FIFO);
++	}
++	st.rx_bytes += bytes;
++	if (drop) {
++		return;
++	}
++	const uint8_t *p = (const uint8_t *)buf;
++	for (unsigned i = 0; i < bytes; ++i) {
++		uint8_t b = p[i];
++
++		switch (st.h4_expect) {
++		case 0: /* type */
++			st.h4_len = 0;
++			if (b == H4_EVENT) {
++				st.h4_buf[st.h4_len++] = b;
++				st.h4_expect = 1;
++			}
++			break;
++		case 1: /* event code */
++			st.h4_buf[st.h4_len++] = b;
++			if (b == HCI_EV_VENDOR) {
++				st.h4_have_event = true;
++				st.h4_expect = 2;
++			} else {
++				st.h4_expect = 0;
++			}
++			break;
++		case 2: /* length */
++			st.h4_buf[st.h4_len++] = b;
++			st.h4_expect = 3;
++			break;
++		case 3: /* payload */
++			st.h4_buf[st.h4_len++] = b;
++			if (st.h4_have_event && st.h4_len >= 3u + st.h4_buf[2]) {
++				const uint8_t *pl = st.h4_buf + 3;
++				if (pl[0] == EDL_CMD_REQ_RES_EVT &&
++				    pl[1] == EDL_APP_VER_RES_EVT &&
++				    st.h4_len >= 3u + st.h4_buf[2]) {
++					const uint8_t *v = pl + 2;
++					st.product_id = (uint32_t)v[0] |
++					    ((uint32_t)v[1] << 8) |
++					    ((uint32_t)v[2] << 16) |
++					    ((uint32_t)v[3] << 24);
++					st.patch_ver = (uint32_t)v[4] | ((uint32_t)v[5] << 8);
++					st.rom_ver = (uint32_t)v[6] | ((uint32_t)v[7] << 8);
++					st.soc_id = (uint32_t)v[8] |
++					    ((uint32_t)v[9] << 8) |
++					    ((uint32_t)v[10] << 16) |
++					    ((uint32_t)v[11] << 24);
++					st.edl_seen = true;
++					st.edl_ok = true;
++					printf("VEUX BT: EDL version cresp=%u rtype=%u "
++					    "product=0x%08x patch=%u rom=%u soc=0x%08x\n",
++					    pl[0], pl[1], st.product_id, st.patch_ver,
++					    st.rom_ver, st.soc_id);
++				} else {
++					printf("VEUX BT: vendor event cresp=%u rtype=%u len=%u\n",
++					    pl[0], pl[1], st.h4_buf[2]);
++					st.edl_seen = true;
++				}
++				st.h4_expect = 0;
++				st.h4_have_event = false;
++			} else if (st.h4_len >= sizeof(st.h4_buf)) {
++				st.h4_expect = 0;
++			}
++			break;
++		}
++	}
++}
++
++static void
++bt_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 0;
++	int enabled = 1;
++
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("veuxbt", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("veuxbtdelay", &delay_s, sizeof(delay_s));
++	printf("VEUX BT: enable=%d delay=%u\n", enabled, delay_s);
++	if (!enabled) {
++		printf("VEUX BT: disabled (veuxbt=0)\n");
++		goto out;
++	}
++
++	bt_wait(delay_s * 1000u);
++	printf("VEUX BT: mapping GCC/TLMM/SE1\n");
++	st.gcc = ml_io_map(BT_GCC_PA, BT_GCC_SIZE);
++	st.gpio = ml_io_map(BT_GPIO_PA, BT_GPIO_SIZE);
++	st.se = ml_io_map(BT_SE_PA, BT_SE_SIZE);
++	if (!st.gcc || !st.gpio || !st.se) {
++		printf("VEUX BT: MMIO mapping failed\n");
++		goto out;
++	}
++	if (!bt_clocks()) {
++		goto out;
++	}
++	bt_gpio(BT_GPIO_SW_CTRL, 0, 0, true, true); /* BT_SW_CTRL high */
++	bt_gpio(BT_GPIO_CTS, 1, 0, false, false);   /* CTS input */
++	bt_gpio(BT_GPIO_RTS, 1, 2, true, true);     /* RTS out, pull-down */
++	bt_gpio(BT_GPIO_TX, 1, 3, true, true);      /* TX out, pull-up */
++	bt_gpio(BT_GPIO_RX, 1, 0, false, false);    /* RX input */
++	bt_se_init();
++
++	printf("VEUX BT: cts=%u rts=%u\n",
++	    (bt_rd(st.gpio, BT_GPIO_CTS * 0x1000u + 4u) & 1u),
++	    (bt_rd(st.gpio, BT_GPIO_RTS * 0x1000u + 4u) & 1u));
++
++	/* QCN3990: 2400 baud, off pulse; 115200 baud, on pulse; resync RX. */
++	bt_set_baud(2400);
++	const uint8_t off_pulse = QCA_WCN3990_POWEROFF_PULSE;
++	if (!bt_tx(&off_pulse, 1)) {
++		goto out;
++	}
++	bt_wait(10);
++	bt_set_baud(115200);
++	const uint8_t on_pulse = QCA_WCN3990_POWERON_PULSE;
++	if (!bt_tx(&on_pulse, 1)) {
++		goto out;
++	}
++	bt_wait(100);
++
++	bt_start_rx();
++	bt_rx_drain(true); /* inherited */
++
++	/* EDL version request: HCI command 0xFC00, param 0x19. */
++	const uint8_t edl_cmd[] = {H4_CMD, 0x00, 0xFC, 0x01, EDL_PATCH_VER_REQ_CMD};
++	if (!bt_tx(edl_cmd, sizeof(edl_cmd))) {
++		goto out;
++	}
++	for (unsigned i = 0; i < 100 && !st.edl_seen; ++i) {
++		bt_rx_drain(false);
++		bt_wait(10);
++	}
++	printf("VEUX BT: EDL response %s (rx bytes %llu)\n",
++	    st.edl_seen ? "received" : "none", st.rx_bytes);
++
++	while (!st.dead) {
++		bt_rx_drain(false);
++		bt_wait(10);
++	}
++
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++veux_bt_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++
++	if (st.started) {
++		return;
++	}
++	st.started = true;
++	(void)PE_parse_boot_argn("veuxbt", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("VEUX BT: disabled (veuxbt=0)\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(bt_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("VEUX BT: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_VEUX */
++

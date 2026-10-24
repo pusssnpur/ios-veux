@@ -1,0 +1,17 @@
+# device dumps: persist/modemst/fsg hold IMEI + calibration; live DT holds the serial
+backup/
+dtb/
+recovery/
+# local boot/survey logs: FDT pulls and bootlogs carry the serial number
+logs/
+# Apple firmware + root-image artifacts (copyrighted; never commit)
+*.ipsw
+*.dmg
+ios16-root*.img
+ios16-root*.simg
+# third-party/Apple sources fetched for reading
+research/
+shim/out/
+xnu/out/
+xnu/out-*/
+__pycache__/

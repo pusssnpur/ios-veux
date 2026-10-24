@@ -1,0 +1,692 @@
+diff --git a/bsd/dev/veux_bt.c b/bsd/dev/veux_bt.c
+index 813b6f0..35abd1c 100644
+--- a/bsd/dev/veux_bt.c
++++ b/bsd/dev/veux_bt.c
+@@ -34,6 +34,9 @@
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t thread_terminate(thread_t);
+ void veux_bt_init(void);
++void veux_bt_hci_send(const uint8_t *data, uint32_t len);
++void veux_bt_hci_set_rx_handler(void (*handler)(const uint8_t *, uint32_t, void *), void *context);
++unsigned veux_bt_hci_poll(void);
+ 
+ #define BT_SE_PA        0x04a84000u	/* qupv3_se1 HS UART */
+ #define BT_SE_SIZE      0x00004000u
+@@ -165,6 +168,15 @@ void veux_bt_init(void);
+ #define EDL_APP_VER_RES_EVT     0x02
+ #define HCI_EV_VENDOR           0xFF
+ 
++/* HCI command opcodes bluetoothd sends at startup (Opcode = (OGF<<8)|OCF). */
++#define HCI_OP_RESET            0x0C03u
++#define HCI_OP_SET_EVENT_MASK   0x0C01u
++#define HCI_OP_READ_LOCAL_VER   0x1001u
++#define HCI_OP_READ_LOCAL_FEATS 0x1003u
++#define HCI_OP_READ_BUFFER_SIZE 0x1005u
++#define HCI_OP_READ_BD_ADDR     0x1009u
++#define HCI_OP_READ_LOCAL_NAME  0x1008u
++
+ #define BT_RX_BUF_WORDS 16u
+ 
+ static struct {
+@@ -177,6 +189,9 @@ static struct {
+ 	unsigned h4_len;
+ 	uint8_t h4_expect;
+ 	bool h4_have_event;
++	uint32_t hci_baud;	/* current UART baud (115200 after init) */
++	void (*hci_rx_handler)(const uint8_t *, uint32_t, void *);
++	void *hci_rx_ctx;
+ } st;
+ static int bt_sleep_chan;
+ 
+@@ -550,16 +565,18 @@ bt_thread(void *arg, wait_result_t result)
+ 		goto out;
+ 	}
+ 	bt_gpio(BT_GPIO_SW_CTRL, 0, 0, true, true); /* BT_SW_CTRL high */
+-	bt_gpio(BT_GPIO_CTS, 1, 0, false, false);   /* CTS input */
++	bt_gpio(BT_GPIO_CTS, 1, 0, false, false);   /* CTS input, no pull */
+ 	bt_gpio(BT_GPIO_RTS, 1, 2, true, true);     /* RTS out, pull-down */
+ 	bt_gpio(BT_GPIO_TX, 1, 3, true, true);      /* TX out, pull-up */
+-	bt_gpio(BT_GPIO_RX, 1, 0, false, false);    /* RX input */
++	bt_gpio(BT_GPIO_RX, 1, 0, false, false);    /* RX input, no pull */
+ 	bt_se_init();
+ 
+ 	printf("VEUX BT: cts=%u rts=%u\n",
+ 	    (bt_rd(st.gpio, BT_GPIO_CTS * 0x1000u + 4u) & 1u),
+ 	    (bt_rd(st.gpio, BT_GPIO_RTS * 0x1000u + 4u) & 1u));
+ 
++	st.hci_baud = 115200u;
++
+ 	/* QCN3990: 2400 baud, off pulse; 115200 baud, on pulse; resync RX. */
+ 	bt_set_baud(2400);
+ 	const uint8_t off_pulse = QCA_WCN3990_POWEROFF_PULSE;
+@@ -575,22 +592,25 @@ bt_thread(void *arg, wait_result_t result)
+ 	bt_wait(100);
+ 
+ 	bt_start_rx();
+-	bt_rx_drain(true); /* inherited */
++	bt_rx_dispatch(); /* drain inherited */
+ 
+-	/* EDL version request: HCI command 0xFC00, param 0x19. */
++	/* EDL version request: HCI command 0xFC00, param 0x19 (diagnostic). */
+ 	const uint8_t edl_cmd[] = {H4_CMD, 0x00, 0xFC, 0x01, EDL_PATCH_VER_REQ_CMD};
+ 	if (!bt_tx(edl_cmd, sizeof(edl_cmd))) {
+ 		goto out;
+ 	}
+ 	for (unsigned i = 0; i < 100 && !st.edl_seen; ++i) {
+-		bt_rx_drain(false);
++		bt_rx_dispatch();
+ 		bt_wait(10);
+ 	}
+ 	printf("VEUX BT: EDL response %s (rx bytes %llu)\n",
+ 	    st.edl_seen ? "received" : "none", st.rx_bytes);
+ 
++	/* Main RX polling loop. The IOKit driver (VeuxBluetoothHCI) also calls
++	 * veux_bt_hci_poll() from its timer context; this loop is a fallback for
++	 * when no IOKit consumer is present. */
+ 	while (!st.dead) {
+-		bt_rx_drain(false);
++		bt_rx_dispatch();
+ 		bt_wait(10);
+ 	}
+ 
+@@ -599,6 +619,110 @@ out:
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++static void
++bt_hci_rx_frame(const uint8_t *data, uint32_t len)
++{
++	if (st.hci_rx_handler) {
++		st.hci_rx_handler(data, len, st.hci_rx_ctx);
++	}
++}
++
++static void
++bt_rx_dispatch(void)
++{
++	uint32_t status = bt_rd(st.se, SE_GENI_RX_FIFO_STATUS);
++	unsigned wc = (unsigned)(status & RX_FIFO_WC_MSK);
++	if (!wc) {
++		return;
++	}
++	if (wc > BT_RX_BUF_WORDS) {
++		wc = BT_RX_BUF_WORDS;
++	}
++	unsigned rbv = (status & RX_LAST_BYTE_VALID_MSK) >>
++	    RX_LAST_BYTE_VALID_SHFT;
++	bool last = (status & RX_LAST) != 0u;
++	unsigned bytes = (wc - 1u) * 4u;
++	bytes += (last && rbv) ? rbv : 4u;
++
++	uint32_t buf[BT_RX_BUF_WORDS];
++	for (unsigned i = 0; i < wc; ++i) {
++		buf[i] = bt_rd(st.se, SE_GENI_RX_FIFO);
++	}
++	st.rx_bytes += bytes;
++
++	/* H4 reassembly: accumulate bytes into st.h4_buf, dispatch complete frames. */
++	const uint8_t *p = (const uint8_t *)buf;
++	for (unsigned i = 0; i < bytes; ++i) {
++		uint8_t b = p[i];
++
++		switch (st.h4_expect) {
++		case 0: /* H4 type byte */
++			st.h4_len = 0;
++			st.h4_buf[st.h4_len++] = b;
++			if (b == H4_CMD || b == H4_EVENT || b == 0x02u || b == 0x03u) {
++				st.h4_expect = 1;
++			} else {
++				st.h4_expect = 0; /* unknown type, drop */
++			}
++			break;
++		case 1: /* event code / ACL handle */
++			st.h4_buf[st.h4_len++] = b;
++			if (b == HCI_EV_VENDOR) {
++				st.h4_have_event = true;
++			}
++			st.h4_expect = 2;
++			break;
++		case 2: /* length byte */
++			st.h4_buf[st.h4_len++] = b;
++			st.h4_expect = 3;
++			break;
++		case 3: /* payload */
++			st.h4_buf[st.h4_len++] = b;
++			if (st.h4_len >= 3u + st.h4_buf[2]) {
++				/* Complete H4 frame. */
++				bt_hci_rx_frame(st.h4_buf, st.h4_len);
++				st.h4_expect = 0;
++				st.h4_have_event = false;
++			} else if (st.h4_len >= sizeof(st.h4_buf)) {
++				st.h4_expect = 0;
++			}
++			break;
++		}
++	}
++}
++
++void
++veux_bt_hci_send(const uint8_t *data, uint32_t len)
++{
++	if (!st.se || !data || !len) {
++		return;
++	}
++	bt_tx(data, len);
++}
++
++void
++veux_bt_hci_set_rx_handler(void (*handler)(const uint8_t *, uint32_t, void *), void *context)
++{
++	st.hci_rx_handler = handler;
++	st.hci_rx_ctx = context;
++}
++
++unsigned
++veux_bt_hci_poll(void)
++{
++	if (!st.se) {
++		return 0;
++	}
++	bt_rx_dispatch();
++	return st.rx_bytes;
++}
++
++void
++veux_bt_hci_shutdown(void)
++{
++	st.dead = true;
++}
++
+ void
+ veux_bt_init(void)
+ {
+@@ -623,3 +747,5 @@ veux_bt_init(void)
+ }
+ #endif /* ARM64_BOARD_CONFIG_VEUX */
+ 
++/* Exported for VeuxBluetoothHCI (IOKit). Declared in veux_bt.h, defined above. */
++
+diff --git a/bsd/dev/veux_bt.h b/bsd/dev/veux_bt.h
+new file mode 100644
+index 0000000..7395960
+--- /dev/null
++++ b/bsd/dev/veux_bt.h
+@@ -0,0 +1,50 @@
++/*
++ * VEUX Bluetooth HCI C interface.
++ *
++ * veux_bt.c owns the WCN3990 GENI HS UART (SE1).  VeuxBluetoothHCI (IOKit)
++ * layers on top of it to expose an IOBluetoothHCIController-compatible service
++ * to iOS userspace (bluetoothd).
++ *
++ * All functions are safe to call from any kernel context; the UART itself is
++ * polled (no GIC interrupts), so veux_bt_hci_poll() must be called
++ * periodically to drain RX.
++ */
++#ifndef _VEUX_BT_H_
++#define _VEUX_BT_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Initialize the BT UART: map MMIO, vote clocks, program RCG to 7372800 Hz,
++ * configure GPIOs (61-64 mux qup01, 69 SW_CTRL high), init the GENI SE,
++ * send the QCA power pulses (0xC0@2400, 0xFC@115200), start RX at 115200.
++ * Returns true on success. */
++bool veux_bt_hci_init(void);
++
++/* Send an H4 frame (HCI command or ACL data) to the WCN3990 over UART.
++ * data[0] is the H4 type byte (0x01=cmd, 0x04=event, 0x02=ACL, 0x03=synchronous). */
++void veux_bt_hci_send(const uint8_t *data, uint32_t len);
++
++/* Register a callback for received H4 frames.  Called from the BT polling
++ * context; keep the handler short and non-blocking. */
++typedef void (*veux_bt_hci_rx_t)(const uint8_t *data, uint32_t len, void *context);
++void veux_bt_hci_set_rx_handler(veux_bt_hci_rx_t handler, void *context);
++
++/* Poll the UART RX FIFO once and dispatch complete H4 frames to the handler.
++ * Returns the number of RX bytes consumed.  Call periodically (e.g. from a
++ * workloop timer) if no IOKit consumer is present. */
++unsigned veux_bt_hci_poll(void);
++
++/* Stop the BT polling loop. */
++void veux_bt_hci_shutdown(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _VEUX_BT_H_ */
++
+diff --git a/iokit/Kernel/arm/VeuxBluetoothHCI.cpp b/iokit/Kernel/arm/VeuxBluetoothHCI.cpp
+new file mode 100644
+index 0000000..6e29a85
+--- /dev/null
++++ b/iokit/Kernel/arm/VeuxBluetoothHCI.cpp
+@@ -0,0 +1,308 @@
++/*
++ * VEUX Bluetooth HCI Controller IOKit emulation.
++ *
++ * See VeuxBluetoothHCI.h for design notes and ABI caveats.
++ */
++#include "VeuxBluetoothHCI.h"
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOCommandGate.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/system.h>
++#include <libkern/c++/OSObject.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <mach/mach_types.h>
++#include <mach/message.h>
++#include <sys/proc.h>
++#include <bsd/dev/veux_bt.h>
++
++#define kVBTServiceName		"IOBluetoothHCIController"
++#define kVBTPropertyVendorID	"idVendor"
++#define kVBTPropertyProductID	"idProduct"
++#define kVBTPropertyBDAddr	"BluetoothAddress"
++
++#define VBT_POLL_MS		10
++
++/* Fake BD address for the WCN3990 (locally administered, random). */
++static const uint8_t kVBTBDAddr[6] = { 0x02, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E };
++
++/* Fake local version info (Bluetooth 5.2, WCN3990-like). */
++static const uint8_t kVBTLocalVersion[] = { 0x09, 0x0C, 0x00, 0x00, 0x00, 0x00 };
++
++VeuxBluetoothHCI *VeuxBluetoothHCI::gInstance = NULL;
++
++OSDefineMetaClassAndStructors(VeuxBluetoothHCI, IOService)
++OSDefineMetaClassAndStructors(VeuxBluetoothHCIRootUserClient, IOUserClient)
++
++IOExternalMethodDispatch VeuxBluetoothHCIRootUserClient::sMethods[kVBTMethodMax] = {
++	/* kVBTMethodSendHCI: structure input, no checks */
++	{ (IOExternalMethodAction) &VeuxBluetoothHCIRootUserClient::hci_send_ext,
++	    0, 0, 0, 0 },
++	/* kVBTMethodRegisterPort: 3 scalar inputs (port, type, refcon) */
++	{ (IOExternalMethodAction) &VeuxBluetoothHCIRootUserClient::register_port_ext,
++	    3, 0, 0, 0 },
++	/* kVBTMethodGetState: 1 scalar output */
++	{ (IOExternalMethodAction) &VeuxBluetoothHCIRootUserClient::get_state_ext,
++	    0, 0, 1, 0 },
++};
++
++/* ---------------- VeuxBluetoothHCI ---------------- */
++
++bool
++VeuxBluetoothHCI::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++
++	/* Publish properties so bluetoothd can identify the controller. */
++	setProperty(kVBTPropertyVendorID, 0x05AC); /* Apple vendor ID */
++	setProperty(kVBTPropertyProductID, 0x8290); /* placeholder product ID */
++	setProperty(kVBTPropertyBDAddr, kVBTBDAddr, 6 * 8);
++	setProperty("BluetoothHCIController", true);
++
++	/* Register the service so IOService matching can find us. */
++	registerService();
++
++	gInstance = this;
++	fWorkLoop = getWorkLoop();
++	fCommandGate = IOCommandGate::commandGate(this);
++	if (!fCommandGate || fWorkLoop->addEventSource(fCommandGate) != kIOReturnSuccess) {
++		return false;
++	}
++
++	/* Poll timer: drain UART RX periodically. */
++	fPollTimer = IOTimerEventSource::timerEventSource(this,
++	    (IOTimerEventSource::Action) &VeuxBluetoothHCI::poll_timer);
++	if (!fPollTimer || fWorkLoop->addEventSource(fPollTimer) != kIOReturnSuccess) {
++		return false;
++	}
++	fPollTimer->setTimeoutMS(VBT_POLL_MS);
++
++	/* Connect to the UART driver (init already done by bt_thread from
++	 * veux_ufs.c; just set the RX handler here). */
++	veux_bt_hci_set_rx_handler(&VeuxBluetoothHCI::hci_rx_handler, this);
++
++	fEnabled = true;
++	fHaveEventMask = false;
++	printf("VEUX BT-HCI: service registered as %s\n", kVBTServiceName);
++	return true;
++}
++
++void
++VeuxBluetoothHCI::stop(IOService *provider)
++{
++	fEnabled = false;
++	if (fPollTimer) {
++		fPollTimer->cancelTimeout();
++		fWorkLoop->removeEventSource(fPollTimer);
++	}
++	if (fCommandGate) {
++		fWorkLoop->removeEventSource(fCommandGate);
++	}
++	veux_bt_hci_shutdown();
++	gInstance = NULL;
++	IOService::stop(provider);
++}
++
++void
++VeuxBluetoothHCI::poll_timer(__unused IOTimerEventSource *sender, __unused void *context)
++{
++	if (!gInstance || !gInstance->fEnabled) {
++		return;
++	}
++	unsigned n = veux_bt_hci_poll();
++	if (n) {
++		printf("VEUX BT-HCI: polled %u RX bytes\n", n);
++	}
++	fPollTimer->setTimeoutMS(VBT_POLL_MS);
++}
++
++void
++VeuxBluetoothHCI::hci_rx_handler(const uint8_t *data, uint32_t len, void *context)
++{
++	VeuxBluetoothHCI *self = (VeuxBluetoothHCI *)context;
++	if (!self || !self->fEnabled) {
++		return;
++	}
++	self->deliver_event(data, len);
++}
++
++void
++VeuxBluetoothHCI::deliver_event(const uint8_t *data, uint32_t len)
++{
++	if (!fNotifyMachPort) {
++		return; /* no one listening */
++	}
++
++	/* Build an async notification: [type u32][len u32][data...] */
++	uint32_t header[2] = { kHCIEventVendorSpecific, (uint32_t)len };
++	uint32_t values[2 + (512 / 4)];
++	uint32_t count = 2;
++	for (uint32_t i = 0; i < len && i < 512; i += 4) {
++		uint32_t word = 0;
++		for (uint32_t j = 0; j < 4 && (i + j) < len; j++) {
++			word |= (uint32_t)data[i + j] << (8 * j);
++		}
++		values[count++] = word;
++	}
++
++	setAsyncReference64(fAsyncRef, fNotifyMachPort, 0, 0, current_task());
++	sendAsyncResult64WithOptions(fAsyncRef, kIOReturnSuccess,
++	    (io_user_reference_t *)values, count, 0);
++}
++
++/* ---------------- VeuxBluetoothHCIRootUserClient ---------------- */
++
++bool
++VeuxBluetoothHCIRootUserClient::start(IOService *provider)
++{
++	fOwner = OSDynamicCast(VeuxBluetoothHCI, provider);
++	if (!fOwner || !fOwner->is_enabled()) {
++		return false;
++	}
++	if (!IOUserClient::start(provider)) {
++		return false;
++	}
++	fClientPort = MACH_PORT_NULL;
++	fIsOpen = true;
++	printf("VEUX BT-HCI: user client opened\n");
++	return true;
++}
++
++IOReturn
++VeuxBluetoothHCIRootUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *dispatch,
++    OSObject *target,
++    void *reference)
++{
++	if (!fOwner || !fIsOpen) {
++		return kIOReturnNotAttached;
++	}
++
++	switch (selector) {
++	case kVBTMethodSendHCI: {
++		/* args->structureInput = HCI command/ACL bytes, structureInputSize = len */
++		if (args->structureInput && args->structureInputSize > 0) {
++			const uint8_t *cmd = (const uint8_t *)args->structureInput;
++			/* Forward HCI commands (type 0x01) to the UART. */
++			if (cmd[0] == 0x01u) {
++				veux_bt_hci_send(cmd, args->structureInputSize);
++			}
++			/* Answer locally-answerable commands synchronously. */
++			if (args->structureInputSize >= 4u && cmd[0] == 0x01u) {
++				uint16_t opcode = (uint16_t)cmd[2] | ((uint16_t)cmd[3] << 8);
++				if (opcode == HCI_OP_RESET) {
++					/* HCI_Reset: answer Command Complete locally. */
++					uint8_t cc[] = { 0x04u, 0x0Eu, 0x04u, 0x01u, 0x03u, 0x0Cu, 0x00u };
++					fOwner->deliver_event(cc, sizeof(cc));
++				} else if (opcode == HCI_OP_READ_LOCAL_VER) {
++					uint8_t cc[] = { 0x04u, 0x0Eu, 0x0Cu, 0x01u, 0x10u,
++					    0x09u, 0x0Cu, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u };
++					fOwner->deliver_event(cc, sizeof(cc));
++				} else if (opcode == HCI_OP_READ_BD_ADDR) {
++					uint8_t cc[] = { 0x04u, 0x0Eu, 0x07u, 0x01u, 0x09u, 0x10u,
++					    0x02u, 0x1Au, 0x2Bu, 0x3Cu, 0x4Du, 0x5Eu };
++					fOwner->deliver_event(cc, sizeof(cc));
++				} else if (opcode == HCI_OP_SET_EVENT_MASK) {
++					uint8_t cc[] = { 0x04u, 0x0Eu, 0x04u, 0x01u, 0x01u, 0x0Cu, 0x00u };
++					fOwner->deliver_event(cc, sizeof(cc));
++					if (args->structureInputSize >= 12) {
++						for (int i = 0; i < 8; i++) {
++							fOwner->fEventMask[i] = cmd[4 + i];
++						}
++						fOwner->fHaveEventMask = true;
++					}
++				}
++			}
++		}
++		return kIOReturnSuccess;
++	}
++	case kVBTMethodRegisterPort: {
++		/* args->scalarInput[0] = mach port, [1] = type, [2] = refcon */
++		if (args->scalarInputCount >= 1) {
++			fClientPort = (mach_port_t)args->scalarInput[0];
++			fOwner->fNotifyMachPort = fClientPort;
++			setAsyncReference64(fClientAsyncRef, fClientPort, 0, 0, current_task());
++			fOwner->fAsyncRef = fClientAsyncRef;
++		}
++		return kIOReturnSuccess;
++	}
++	case kVBTMethodGetState: {
++		if (args->scalarOutputCount >= 1) {
++			args->scalarOutput[0] = fOwner->fEnabled ? 1u : 0u;
++			args->scalarOutputSize = 1;
++		}
++		return kIOReturnSuccess;
++	}
++	default:
++		return kIOReturnBadArgument;
++	}
++}
++
++IOReturn
++VeuxBluetoothHCIRootUserClient::hci_send_ext(__unused OSObject *target,
++    __unused void *reference, uint32_t selector,
++    IOExternalMethodArguments *args)
++{
++	if (!args->structureInput || args->structureInputSize == 0) {
++		return kIOReturnBadArgument;
++	}
++	return ((VeuxBluetoothHCIRootUserClient *)target)->hci_send(
++	    (const uint8_t *)args->structureInput, args->structureInputSize);
++}
++
++IOReturn
++VeuxBluetoothHCIRootUserClient::register_port_ext(__unused OSObject *target,
++    __unused void *reference, uint32_t selector,
++    IOExternalMethodArguments *args)
++{
++	if (args->scalarInputCount < 1) {
++		return kIOReturnBadArgument;
++	}
++	return ((VeuxBluetoothHCIRootUserClient *)target)->registerNotificationPort(
++	    (mach_port_t)args->scalarInput[0], 0, 0);
++}
++
++IOReturn
++VeuxBluetoothHCIRootUserClient::get_state_ext(__unused OSObject *target,
++    __unused void *reference, uint32_t selector,
++    IOExternalMethodArguments *args)
++{
++	if (args->scalarOutputCount < 1) {
++		return kIOReturnBadArgument;
++	}
++	args->scalarOutput[0] = ((VeuxBluetoothHCIRootUserClient *)target)->fOwner
++	    ? (((VeuxBluetoothHCIRootUserClient *)target)->fOwner->fEnabled ? 1u : 0u)
++	    : 0u;
++	args->scalarOutputSize = 1;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++VeuxBluetoothHCIRootUserClient::hci_send(const uint8_t *data, uint32_t len)
++{
++	if (!fIsOpen || !data || !len) {
++		return kIOReturnBadArgument;
++	}
++	veux_bt_hci_send(data, len);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++VeuxBluetoothHCIRootUserClient::registerNotificationPort(mach_port_t port,
++    __unused UInt32 type, IOAsyncReference64 asyncRef)
++{
++	fClientPort = port;
++	fClientAsyncRef = asyncRef;
++	if (fOwner) {
++		fOwner->fNotifyMachPort = port;
++		fOwner->fAsyncRef = asyncRef;
++	}
++	return kIOReturnSuccess;
++}
+diff --git a/iokit/Kernel/arm/VeuxBluetoothHCI.h b/iokit/Kernel/arm/VeuxBluetoothHCI.h
+new file mode 100644
+index 0000000..5da0bcb
+--- /dev/null
++++ b/iokit/Kernel/arm/VeuxBluetoothHCI.h
+@@ -0,0 +1,99 @@
++/*
++ * VEUX Bluetooth HCI Controller IOKit emulation.
++ *
++ * Exposes an IOBluetoothHCIController-compatible service so that iOS
++ * userspace (bluetoothd) can talk to the WCN3990 over our GENI HS UART.
++ *
++ * NOTE (code-blind): the exact IOBluetoothHCIController user-client ABI
++ * (external method selectors, argument structures, notification format) is
++ * Apple-proprietary.  This implementation is a best-effort reconstruction
++ * from the public Bluetooth HCI spec and the patterns in VeuxSurface.cpp /
++ * VeuxFramebuffer.cpp.  It will need iteration once bluetoothd can be
++ * observed on a real boot.
++ *
++ * HCI command flow:
++ *   bluetoothd -> externalMethod(kVBTMethodSendHCI) -> veux_bt_hci_send()
++ *     -> UART -> WCN3990
++ * HCI event flow:
++ *   WCN3990 -> UART -> veux_bt_hci_poll() -> rx_handler()
++ *     -> sendAsyncResult64() -> bluetoothd
++ */
++#ifndef _VEUX_BLUETOOTH_HCI_H_
++#define _VEUX_BLUETOOTH_HCI_H_
++
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOCommandGate.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <libkern/c++/OSObject.h>
++
++/* External method selectors for VeuxBluetoothHCIRootUserClient.
++ * Estimated - verify against real bluetoothd traces. */
++enum {
++	kVBTMethodSendHCI		= 0,	/* input:  HCI command/ACL bytes (structure) */
++	kVBTMethodRegisterPort	= 1,	/* input:  mach port for async notifications */
++	kVBTMethodGetState		= 2,	/* output: controller state (scalar) */
++	kVBTMethodMax
++};
++
++/* HCI event types we forward to bluetoothd. */
++enum {
++	kHCIEventCommandComplete	= 0x0Fu,
++	kHCIEventCommandStatus		= 0x0Fu,
++	kHCIEventVendorSpecific		= 0xFFu,
++};
++
++class VeuxBluetoothHCI : public IOService {
++	OSDeclareDefaultStructors(VeuxBluetoothHCI)
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++
++	/* Called by the veux_bt.c RX poll path when a complete H4 frame arrives. */
++	static void hci_rx_handler(const uint8_t *data, uint32_t len, void *context);
++
++	/* Deliver an HCI event (or ACL data) to bluetoothd via async notification. */
++	void deliver_event(const uint8_t *data, uint32_t len);
++
++	bool is_enabled(void) const { return fEnabled; }
++
++private:
++	static VeuxBluetoothHCI *gInstance;
++	IOWorkLoop		*fWorkLoop;
++	IOCommandGate	*fCommandGate;
++	IOTimerEventSource	*fPollTimer;
++	IONotificationPort	*fNotifyPort;
++	mach_port_t		fNotifyMachPort;
++	IOAsyncReference64	fAsyncRef;
++	bool		fEnabled;
++	bool		fHaveEventMask;
++	uint8_t		fEventMask[8];
++};
++
++class VeuxBluetoothHCIRootUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(VeuxBluetoothHCIRootUserClient)
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector,
++	    IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn registerNotificationPort(mach_port_t port,
++	    UInt32 type, IOAsyncReference64 asyncRef) APPLE_KEXT_OVERRIDE;
++
++	IOReturn hci_send(const uint8_t *data, uint32_t len);
++
++private:
++	VeuxBluetoothHCI	*fOwner;
++	mach_port_t		fClientPort;
++	IOAsyncReference64	fClientAsyncRef;
++	bool		fIsOpen;
++
++	static IOExternalMethodDispatch sMethods[kVBTMethodMax];
++};
++
++#endif /* _VEUX_BLUETOOTH_HCI_H_ */
++
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 844fb4a..53707ff 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -20,3 +20,4 @@ iokit/Kernel/arm/hid/VeuxHID.cpp                                optional iokitcp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
++iokit/Kernel/arm/VeuxBluetoothHCI.cpp                            optional iokitcpp
