@@ -11,7 +11,7 @@ on:
         default: DEVELOPMENT
       machine_config:
         description: xnu MACHINE_CONFIG
-        default: SWEET
+        default: VEUX
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
